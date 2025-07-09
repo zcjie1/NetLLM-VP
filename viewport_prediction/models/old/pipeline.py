@@ -49,18 +49,24 @@ class EmbeddingModelViewportPrediction(nn.Module):
         seq_len = x.shape[1]
         batch_embeddings = []
         for i in range(seq_len):
+            # conv1d1 接受输入形状 (batch_size, channel=1, 3)，输出是 (batch, 256)
             batch_embeddings.append(self.linear_layer(self.conv1d1(x[:, i, :]).view(1,256)).unsqueeze(1))
+        # 拼接所有时间步，形成序列输入
         x = torch.cat(batch_embeddings, dim=1)
 
         if self.using_multimodal:
+            # 加载图像特征并线性映射，shape: (1, 1, embed_size)
             mapped_tensor = self.get_multimodal_information(video_user_position)
-            x = torch.cat([mapped_tensor, x], dim=1)
+            # 拼接图像 token 到序列前方，相当于加了一个 multimodal 的 "CLS token"
+            x = torch.cat([mapped_tensor, x], dim=1)  # shape: (1, seq_len+1, embed_size)
 
-        x = self.embed_ln(x)
+        x = self.embed_ln(x)  # 对 embedding 做归一化，提升稳定性
 
         self.outputlist = []
-        for _ in range(self.fut_window_length):
+        for _ in range(self.fut_window_length): # 逐步生成未来轨迹
+            # 用 embedding 输入 LLM 进行预测
             outputs = self.plm(inputs_embeds=x, attention_mask = torch.ones(x.shape[0], x.shape[1], dtype=torch.long, device=self.device))
+            # 保存当前时间步的输出 logits，shape: (batch=1, seq_len, hidden)
             self.outputlist.append(outputs.logits)
             x = torch.cat((x, self.linear_layer(self.conv1d1(outputs.logits)).unsqueeze(1)), dim=1)
         return self.outputlist
@@ -107,6 +113,7 @@ class EmbeddingModelViewportPrediction(nn.Module):
         """
         video_index = video_user_position[0].item()
         position_index = video_user_position[2].item()
+        # 计算图象索引 (position_index - 1) * (视频总帧数/采样频率)
         image_index = (position_index - 1) * (cfg.video_frame[self.dataset][video_index-1]//self.frequency)
         # add cache_key
         if image_index % 100 == 0:

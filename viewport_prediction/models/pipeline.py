@@ -129,6 +129,7 @@ class Pipeline(nn.Module):
         gt = future.to(pred.device)
         return pred, gt
     
+    # video_user_position 用于寻找 pth 文件
     def get_multimodal_information(self, video_user_position):
         """
         Get the corresponding image content features.

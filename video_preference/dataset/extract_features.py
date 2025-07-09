@@ -48,7 +48,7 @@ def processeachsub(subdirectories, start_folder):
     for subdir in subdirectories:
         print(subdir)
         count = get_number_of_files(subdir)
-        target_dir = '/home/yec/NetLLM/viewport_prediction/video_feature'
+        target_dir = '/home/yec/NetLLM/video_preference/video_feature'
         target_path = os.path.join(target_dir, subdir.split('/')[-1])
         print('target_path:', target_path)
 
@@ -73,19 +73,20 @@ def store_feature(img_dir, n, count, tensor_dict, folder_number):
     img_tensor = preprocess(img).unsqueeze(0).to(device)
     raw_feature = extract_vit_features(img)
     tensor_dict[f'{n}'] = raw_feature
-    # save the features per 50 images
+    # 当前代码是10帧保存一次，1080P30FPS的视频保存出30个PTH
+    # todo: 一秒保存一次
     if n % 10 == 0:   
-        torch.save(tensor_dict, f'/home/yec/NetLLM/viewport_prediction/video_feature/video{folder_number}_images/feature_dict{n//10}.pth')  # the target dir for saving features.
+        torch.save(tensor_dict, f'/home/yec/NetLLM/video_preference/video_feature/video{folder_number}_images/feature_dict{n//10}.pth')  # the target dir for saving features.
         tensor_dict.clear()
         print(n)
     if n == count:
         if n % 10 !=0:
-            torch.save(tensor_dict, f'/home/yec/NetLLM/viewport_prediction/video_feature/video{folder_number}_images/feature_dict{(n//10)+1}.pth')
+            torch.save(tensor_dict, f'/home/yec/NetLLM/video_preference/video_feature/video{folder_number}_images/feature_dict{(n//10)+1}.pth')
         tensor_dict.clear()
 
 
 if __name__ == "__main__":
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     # the source dir for storing saliency maps
-    subdirectories = ['/home/yec/NetLLM/viewport_prediction/videos/video1_images']
+    subdirectories = ['/home/yec/NetLLM/video_preference/videos/video1_images']
     processeachsub(subdirectories, start_folder=1)

@@ -6,3 +6,12 @@ results
 
 downloaded_plms
 ft_plms
+
+viewport_prediction/videos
+viewport_prediction/video_feature
+viewport_prediction/dataset/preference
+
+
+video_preference/dataset/preference
+video_preference/video_feature
+video_preference/videos

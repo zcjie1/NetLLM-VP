@@ -1,25 +1,18 @@
-import sys
 import argparse
-import os
+from config import cfg  # 假设 config.py 里定义了默认值
+import numpy as np
 import random
 import torch
-import numpy as np
-import torch.nn as nn
-import datetime
-
-import time
+import sys
 import os
-from torch.optim import AdamW
-from config import cfg
 from dataset.load_dataset import create_dataset
-from models.old.networking_head import SimpleLinearTaskHead
+from models.networking_head import NetworkingHead
+from models.low_rank import peft_model
+from models.pipeline import Pipeline
+from utils.plms_utils import load_plm
 from utils.console_logger import ConsoleLogger
-from utils.normalize import normalize_data, denormalize_data
-from utils.result_notebook import ResultNotebook
+from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from models.old.plms_utils import load_plm
-from models.old.pipeline import EmbeddingForViewportPrediction
-from models.low_rank import peft_model, print_trainable_parameters
 
 
 def save_model(args, model, save_dir):
@@ -30,11 +23,10 @@ def save_model(args, model, save_dir):
         # save low rank matrices
         model.plm.save_pretrained(save_dir)
         # save other modules except plm
-        torch.save(model.embedding_model.modules_except_plm.state_dict(), os.path.join(save_dir, 'modules_except_plm.bin'))
+        torch.save(model.modules_except_plm.state_dict(), os.path.join(save_dir, 'modules_except_plm.bin'))
     else:
         # low rank matrices are disabled, save whole model
         torch.save(model.state_dict(), os.path.join(save_dir, 'model.bin'))
-
 
 def load_model(args, model, model_dir):
     """
@@ -46,17 +38,17 @@ def load_model(args, model, model_dir):
         # load low rank matrices
         model.plm.load_adapter(model_dir, adapter_name='default')
         # load other modules except plm
-        model.embedding_model.modules_except_plm.load_state_dict(torch.load(os.path.join(model_dir, 'modules_except_plm.bin'), map_location='cuda:0'))
+        model.modules_except_plm.load_state_dict(torch.load(os.path.join(model_dir, 'modules_except_plm.bin')))
     else:
         # low rank matrices are disabled, load whole model
         model.load_state_dict(torch.load(os.path.join(model_dir, 'model.bin')))
     return model
 
-
-def adapt(args, embedding_model, dataloader_train, dataloader_valid, models_dir, grad_accum_steps):
-    file_prefix = f'his_{args.his_window}_fut_{args.fut_window}_'\
-                  f'ss_{args.sample_step}_epochs_{args.epochs}_bs_{args.bs * args.grad_accum_steps}_lr_{args.lr}_seed_{args.seed}_rank_{args.rank}_teacher_forcing_{args.using_teaching_forcing}_scheduled_sampling_{args.scheduled_sampling}'
+def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_accum_steps):
+    file_prefix = f'his_{args.his_window}_fut_{args.fut_window}_epochs_{args.epochs}_bs_{args.bs * args.grad_accum_steps}_'\
+                  f'lr_{args.lr}_seed_{args.seed}_rank_{args.rank}_scheduled_sampling_{args.scheduled_sampling}'
     checkpoint_path = os.path.join(models_dir, file_prefix, 'checkpoint')
+
     if not os.path.exists(checkpoint_path):
         os.makedirs(checkpoint_path)
     best_model_path = os.path.join(models_dir, file_prefix, 'best_model')
@@ -72,25 +64,24 @@ def adapt(args, embedding_model, dataloader_train, dataloader_valid, models_dir,
     if not args.freeze_plm:
         no_decay = ['bias', 'LayerNorm.weight']
         optimizer_grouped_parameters = [
-            {'params': [p for n, p in embedding_model.plm.named_parameters() if not any(nd in n for nd in no_decay)], 
+            {'params': [p for n, p in pipeline.plm.named_parameters() if not any(nd in n for nd in no_decay)], 
             'weight_decay': args.weight_decay, 'lr': args.lr},
-            {'params': [p for n, p in embedding_model.plm.named_parameters() if any(nd in n for nd in no_decay)], 
+            {'params': [p for n, p in pipeline.plm.named_parameters() if any(nd in n for nd in no_decay)], 
             'weight_decay': 0.0, 'lr': args.lr},
-            {'params': embedding_model.embedding_model.linear_layer.parameters(), 'weight_decay': args.weight_decay, 'lr': args.lr},
-            {'params': embedding_model.embedding_model.embed_ln.parameters(), 'weight_decay': args.weight_decay, 'lr': args.lr},
-            {'params': embedding_model.embedding_model.linear_layer_for_multimodal.parameters(), 'weight_decay': args.weight_decay, 'lr': args.lr}
+            {'params': pipeline.embed_vp.parameters(), 'weight_decay': args.weight_decay, 'lr': args.lr},
+            {'params': pipeline.embed_ln.parameters(), 'weight_decay': args.weight_decay, 'lr': args.lr},
+            {'params': pipeline.embed_multimodal.parameters(), 'weight_decay': args.weight_decay, 'lr': args.lr}
         ]
         optimizer = AdamW(optimizer_grouped_parameters)
     else:
-        # only tune taskhead and some projection
+        # only tune networking head and multimodal encoder
         optimizer_grouped_parameters = [
-            {'params': embedding_model.embedding_model.linear_layer.parameters(), 'weight_decay': args.weight_decay, 'lr': args.lr},
-            {'params': embedding_model.embedding_model.embed_ln.parameters(), 'weight_decay': args.weight_decay, 'lr': args.lr},
-            {'params': embedding_model.embedding_model.linear_layer_for_multimodal.parameters(), 'weight_decay': args.weight_decay, 'lr': args.lr}
+            {'params': pipeline.embed_vp.parameters(), 'weight_decay': args.weight_decay, 'lr': args.lr},
+            {'params': pipeline.embed_ln.parameters(), 'weight_decay': args.weight_decay, 'lr': args.lr},
+            {'params': pipeline.embed_multimodal.parameters(), 'weight_decay': args.weight_decay, 'lr': args.lr}
         ]
         optimizer = AdamW(optimizer_grouped_parameters)
 
-    
     assert args.epochs_per_valid is None or args.steps_per_valid is None, "You can only specify args.epochs_per_valid or args.steps_per_valid."
 
     global_step = 0
@@ -101,51 +92,47 @@ def adapt(args, embedding_model, dataloader_train, dataloader_valid, models_dir,
     best_epoch, best_step = 0, 0
 
     def validate():
-        embedding_model.eval()
+        pipeline.eval()
         with torch.no_grad():
             validata_checkpoint_path = os.path.join(checkpoint_path)
             if not os.path.exists(validata_checkpoint_path):
                 os.makedirs(validata_checkpoint_path)
-            save_model(args, embedding_model, validata_checkpoint_path)
+            save_model(args, pipeline, validata_checkpoint_path)
             print(f'Checkpoint saved at', checkpoint_path)
             valid_loss = []
             for history, future, video_user_info in dataloader_valid:
                 history, future = history.to(args.device), future.to(args.device)
-                history = normalize_data(history, args.train_dataset)
-                future = normalize_data(future, args.train_dataset)
-                loss = embedding_model.autoregressive(history, future, video_user_info)
+                history = history
+                future = future
+                loss = pipeline(history, future, video_user_info, teacher_forcing=False)
                 valid_loss.append(loss.item())
             valid_loss = sum(valid_loss) / len(valid_loss)
-            embedding_model.train()
+            pipeline.train()
             return valid_loss
         
     print(f'Training on {args.train_dataset} - bs: {args.bs} - lr: {args.lr} - seed: {args.seed}')
     for epoch in range(args.epochs):
-        embedding_model.train()
-        for step, (history, future, video_user_info) in enumerate (dataloader_train): 
+        pipeline.train()
+        for step, (history, future, video_user_info) in enumerate(dataloader_train): 
             global_step += 1
             history, future = history.to(args.device), future.to(args.device)
-            history = normalize_data(history, args.train_dataset)
-            future = normalize_data(future, args.train_dataset)
+            history = history
+            future = future
             # using scheduled sampling
             if args.scheduled_sampling:
                 if np.random.rand() > args.mix_rate:
-                    embedding_model.using_teaching_forcing = True
-                    loss = embedding_model(history, future, video_user_info)
+                    loss = pipeline(history, future, video_user_info, teacher_forcing=True)
                 else:
-                    embedding_model.using_teaching_forcing = False
-                    loss = embedding_model.autoregressive(history, future, video_user_info)
+                    loss = pipeline(history, future, video_user_info, teacher_forcing=False)
             else:
-                embedding_model.using_teaching_forcing = True
-                loss = embedding_model(history, future, video_user_info)
+                loss = pipeline(history, future, video_user_info, teacher_forcing=True)
             tot_loss += loss.item()
             loss = loss / grad_accum_steps
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(embedding_model.plm.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(pipeline.plm.parameters(), 1.0)
 
             # perform gradient accumulation update
             if ((step + 1) % grad_accum_steps == 0) or (step + 1 == len(dataloader_train)):
-                # optimizer.zero_grad()
                 optimizer.step()
                 optimizer.zero_grad()
             
@@ -154,12 +141,17 @@ def adapt(args, embedding_model, dataloader_train, dataloader_valid, models_dir,
                 print("Epoch {}, global_step {}, average loss: {}".format(epoch, global_step, (tot_loss - log_loss) / report_loss_per_steps), flush=True)
                 log_loss = tot_loss
             
+            # for debug
+            # if global_step >= 300:
+            #     save_model(args, pipeline, best_model_path)
+            #     break
+            
             # validation by steps
             if args.steps_per_valid is not None and global_step % args.steps_per_valid == 0:
                 valid_loss = validate()
                 if valid_loss < best_loss:
                     best_loss, best_step = valid_loss, global_step
-                    save_model(args, embedding_model, best_model_path)
+                    save_model(args, pipeline, best_model_path)
                     print(f'Best model (step {best_step}, average valid loss {best_loss}) saved at', best_model_path)
                 print('Valid loss', valid_loss, ' - ', 'Best loss', best_loss, 'at step', best_step)
             
@@ -168,7 +160,7 @@ def adapt(args, embedding_model, dataloader_train, dataloader_valid, models_dir,
                 save_checkpoint_path = os.path.join(checkpoint_path, str(global_step // args.save_checkpoint_per_step)) # save checkpoint
                 if not os.path.exists(save_checkpoint_path):
                     os.makedirs(save_checkpoint_path)
-                save_model(args, embedding_model, save_checkpoint_path)
+                save_model(args, pipeline, save_checkpoint_path)
                 print('save checkpoint at', save_checkpoint_path)
 
         # validation by epochs
@@ -176,7 +168,7 @@ def adapt(args, embedding_model, dataloader_train, dataloader_valid, models_dir,
             valid_loss = validate()
             if valid_loss < best_loss:
                 best_loss, best_epoch = valid_loss, epoch
-                save_model(args, embedding_model, best_model_path)
+                save_model(args, pipeline, best_model_path)
                 print(f'Best model (epoch {best_epoch}, average valid loss {best_loss}) saved at', best_model_path)
             print('Valid loss', valid_loss, ' - ', 'Best loss', best_loss, 'at epoch', best_epoch)
         
@@ -185,66 +177,39 @@ def adapt(args, embedding_model, dataloader_train, dataloader_valid, models_dir,
             save_checkpoint_path = os.path.join(checkpoint_path, f'epoch{epoch}') # save checkpoint
             if not os.path.exists(save_checkpoint_path):
                 os.makedirs(save_checkpoint_path)
-            save_model(args, embedding_model, save_checkpoint_path)
+            save_model(args, pipeline, save_checkpoint_path)
             print('save checkpoint at', save_checkpoint_path)
 
     print('Done adaptation, average training loss =', tot_loss / global_step)
 
 
-def test(args, embedding_model, dataloader_test, models_dir, results_dir):
-    file_prefix = f'his_{args.his_window}_fut_{args.fut_window}_'\
-                  f'ss_{args.sample_step}_epochs_{args.epochs}_bs_{args.bs * args.grad_accum_steps}_lr_{args.lr}_seed_{args.seed}_rank_{args.rank}_teacher_forcing_{args.using_teaching_forcing}_scheduled_sampling_{args.scheduled_sampling}'
+def test(args, pipeline, dataloader_test, models_dir, results_dir):
+    file_prefix = f'his_{args.his_window}_fut_{args.fut_window}_epochs_{args.epochs}_bs_{args.bs * args.grad_accum_steps}_'\
+                  f'lr_{args.lr}_seed_{args.seed}_rank_{args.rank}_scheduled_sampling_{args.scheduled_sampling}'
     best_model_path = os.path.join(models_dir, file_prefix, 'best_model')
     result_path = os.path.join(results_dir, file_prefix + '_results.csv')
-    decision_time_path = os.path.join(results_dir, 'decision_times.txt')  # 文件路径
-    notebook = ResultNotebook()
 
     model_path = args.model_path if args.model_path is not None else best_model_path
     if os.path.exists(model_path):
-        embedding_model = load_model(args, embedding_model, model_path)
+        pipeline = load_model(args, pipeline, model_path)
         print('Load weights from:', model_path)
     else:
         print('\033[33mWarning:\033[0m', model_path, 'not found, skip loading weights.')
 
     print(f'Testing on {args.test_dataset} - seed: {args.seed}')
-
-    total_time = 0.0
-    count = 0
-
-    with open(decision_time_path, 'w') as f_time:
-        with torch.no_grad():
-            for history, future, video_user_info in dataloader_test:
-                history, future = history.to(args.device), future.to(args.device)
-                history = normalize_data(history, args.train_dataset)
-
-                start_time = time.perf_counter()
-                pred, gt = embedding_model.inference(history, future, video_user_info)
-                end_time = time.perf_counter()
-
-                decision_time = end_time - start_time
-                total_time += decision_time
-                count += 1
-
-                f_time.write(f"Sample {count}: {decision_time:.6f} seconds\n")
-
-                pred = denormalize_data(pred, args.test_dataset)
-                videos, users, timesteps = [], [], []
-                videos.append(int(video_user_info[0]))
-                users.append(int(video_user_info[1]))
-                timesteps.append(int(video_user_info[2]))
-                videos, users, timesteps = torch.IntTensor(videos), torch.IntTensor(users), torch.IntTensor(timesteps)
-                notebook.record(pred, gt, videos, users, timesteps)
-
-        avg_time = total_time / count if count > 0 else 0
-        f_time.write(f"\nAverage LLM decision time: {avg_time:.6f} seconds\n")
-
-    notebook.write(result_path)
-    print(f"Decision times written to {decision_time_path}")
-            
+    with torch.no_grad():
+        for history, future, video_info in dataloader_test:
+            history, future = history.to(args.device), future.to(args.device)
+            pred, gt = pipeline.inference(history, future, video_info)
+            video_name_ls, height_ls, fps_ls, video_time_ls = [], [], [], []
+            video_name_ls.append(video_info[0])
+            height_ls.append(int(video_info[1]))
+            fps_ls.append(int(video_info[2]))
+            video_time_ls.append(int(video_info[3]))
+            height_ls, fps_ls, video_time_ls = torch.IntTensor(height_ls), torch.IntTensor(fps_ls), torch.IntTensor(video_time_ls)
+            print(pred, gt, video_name_ls, height_ls, fps_ls, video_time_ls)
 
 def run(args):
-    assert args.train_dataset in cfg.dataset_list 
-    assert args.test_dataset in cfg.dataset_list
     assert args.plm_type in cfg.plm_types
     assert args.plm_size in cfg.plm_sizes
     assert args.trim_head >= args.his_window and args.trim_tail >= args.fut_window
@@ -255,16 +220,17 @@ def run(args):
     torch.cuda.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     random.seed(args.seed)
+    
     if args.rank != -1:
-        models_dir = os.path.join(cfg.plms_finetuned_dir, f'{args.plm_type}_{args.plm_size}', 
-                              f'freeze_plm_{args.freeze_plm}', args.train_dataset, f'{args.dataset_frequency}Hz')
-        results_dir = os.path.join(cfg.results_dir, f'{args.plm_type}_{args.plm_size}', 
-                               f'freeze_plm_{args.freeze_plm}', args.test_dataset, f'{args.dataset_frequency}Hz')
+        models_dir = os.path.join(cfg.plms_finetuned_dir, f'{args.plm_type}_{args.plm_size}_low_rank', 
+                              f'freeze_plm_{args.freeze_plm}')
+        results_dir = os.path.join(cfg.results_dir, f'{args.plm_type}_{args.plm_size}_low_rank', 
+                               f'freeze_plm_{args.freeze_plm}')
     else:
         models_dir = os.path.join(cfg.plms_finetuned_dir, f'{args.plm_type}_{args.plm_size}', 
-                              f'freeze_plm_{args.freeze_plm}', args.train_dataset, f'{args.dataset_frequency}Hz')
+                              f'freeze_plm_{args.freeze_plm}')
         results_dir = os.path.join(cfg.results_dir, f'{args.plm_type}_{args.plm_size}', 
-                               f'freeze_plm_{args.freeze_plm}', args.test_dataset, f'{args.dataset_frequency}Hz')
+                               f'freeze_plm_{args.freeze_plm}')
     if not os.path.exists(models_dir): 
         os.makedirs(models_dir)
     if not os.path.exists(results_dir):
@@ -282,14 +248,14 @@ def run(args):
     if args.rank != -1:
         plm = peft_model(plm, args.plm_type, args.rank)
         
-    # set up task head
+    # set up networking head
     input_dim = plm.hidden_size
-    out_dim = 3
+    out_dim = 3  # = the number of viewport coordinates
     if args.plm_type == 'opt' and args.plm_size == 'xxs':
-        task_head = SimpleLinearTaskHead(input_dim=512, output_dim=out_dim, fut_window=args.fut_window).to(args.device_out)
+        networking_head = NetworkingHead(input_dim=512, output_dim=out_dim, fut_window=args.fut_window).to(args.device_out)
     else:
-        task_head = SimpleLinearTaskHead(input_dim=input_dim, output_dim=out_dim, fut_window=args.fut_window).to(args.device_out)
-    plm.set_task_head(task_head)
+        networking_head = NetworkingHead(input_dim=input_dim, output_dim=out_dim, fut_window=args.fut_window).to(args.device_out)
+    plm.set_networking_head(networking_head)
     print('PLM model architecture:')
     print(plm)
     
@@ -312,8 +278,14 @@ def run(args):
     if args.plm_type == 'llava':
         embed_size = 4096
 
-    embedding_model = EmbeddingForViewportPrediction(plm, fut_window=args.fut_window, device=args.device, embed_size=embed_size, frequency=args.dataset_frequency, using_teaching_forcing=args.using_teaching_forcing, using_multimodal=args.using_multimodal, dataset=args.train_dataset)
+    pipeline = Pipeline(plm, fut_window=args.fut_window, device=args.device, embed_size=embed_size, frequency=args.dataset_frequency, using_multimodal=args.using_multimodal, dataset=args.train_dataset)
+    # print_trainable_parameters(pipeline)
 
+    if args.compile:
+        assert torch.__version__ >= '2.0.0', 'Compile model requires torch version >= 2.0.0, but current torch version is ' + torch.__version__
+        print("\033[33mWarning:\033[0m There seems to be some bugs in torch.compile. If batch size is too large, it will raise errors (I don't know why this happens).")
+        prompt_model = torch.compile(prompt_model).to(args.device)  # recommend to compile model when you are using PyTorch 2.0
+    
     torch.set_float32_matmul_precision('high')
 
     if args.adapt:
@@ -323,15 +295,14 @@ def run(args):
         
         dataloader_train = DataLoader(raw_dataset_train, batch_size=args.bs, shuffle=True, pin_memory=True)
         dataloader_valid = DataLoader(raw_dataset_valid, batch_size=args.bs, shuffle=False, pin_memory=True)
-        adapt(args, embedding_model, dataloader_train, dataloader_valid, models_dir, args.grad_accum_steps)
+        adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, args.grad_accum_steps)
 
     if args.test:
         raw_dataset_test = create_dataset(args.test_dataset, his_window=args.his_window, fut_window=args.fut_window,
                                           trim_head=args.trim_head, trim_tail=args.trim_tail, include=['test'], frequency=args.dataset_frequency, step=args.sample_step)[0]
         
         dataloader_test = DataLoader(raw_dataset_test, batch_size=args.bs, shuffle=True, pin_memory=True)
-        test(args, embedding_model, dataloader_test, models_dir, results_dir)
-
+        test(args, pipeline, dataloader_test, models_dir, results_dir)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Process the input parameters to train the network.')
@@ -339,39 +310,27 @@ if __name__ == '__main__':
     # ========== model/plm settings related arguments ==========
     parser.add_argument('--adapt', action="store_true", help='adapt llm.')
     parser.add_argument('--test', action="store_true", help='test llm.')
-    parser.add_argument('--plm-type', action="store", dest='plm_type', help='Type of plm.', default='t5-lm')
-    parser.add_argument('--plm-size', action="store", dest='plm_size', help='Size of plm.', default='base')
-    parser.add_argument('--model-path', action="store", dest='model_path', type=str,
-                        help='(Optional) The directory of model weights to be loaded for testing.')
-    parser.add_argument('--device', action='store', dest='device', help='Device (cuda or cpu) to run experiment.')
-    parser.add_argument('--device-out', action='store', dest='device_out', help='The device (cuda or cpu) to place the split of model near the output.')
-    parser.add_argument('--device-mid', action='store', dest='device_mid', help='The device (cuda or cpu) to place the split of model between the input and output.')
-    parser.add_argument('--freeze-plm', action='store_true', dest='freeze_plm', 
-                        help='Freeze weights of plm during training')
-    parser.add_argument('--compile', action='store_true', dest='compile', 
-                        help='(Optional) Compile model for speed up (available only for PyTorch 2.0).')
-    parser.add_argument('--resume', action='store_true', dest='resume',
-                        help='(Optional) Resume model weights from checkpoint for training.')
-    parser.add_argument('--grad-accum-steps', action="store", dest='grad_accum_steps', type=int, default=16)
+    parser.add_argument('--plm-type', action="store", dest='plm_type', help='type of plm.', default='t5-lm')
+    parser.add_argument('--plm-size', action="store", dest='plm_size', help='size of plm.', default='base')
+    parser.add_argument('--model-path', action="store", dest='model_path', type=str, help='(Optional) The directory of model weights to be loaded for testing.')
+    parser.add_argument('--device', action='store', dest='device', help='the device (cuda or cpu) to run experiment.')
+    parser.add_argument('--device-out', action='store', dest='device_out', help='the device (cuda or cpu) to place the split of model near the output.')
+    parser.add_argument('--device-mid', action='store', dest='device_mid', help='the device (cuda or cpu) to place the split of model between the input and output.')
+    parser.add_argument('--freeze-plm', action='store_true', dest='freeze_plm', help='freeze weights of plm during training')
+    parser.add_argument('--compile', action='store_true', dest='compile', help='(Optional) Compile model for speed up (available only for PyTorch 2.0).')
+    parser.add_argument('--resume', action='store_true', dest='resume', help='(Optional) Resume model weights from checkpoint for training.')
     
-    # ========== dataset settings related arguments ==========
-    parser.add_argument('--train-dataset', action='store', dest='train_dataset', help='Dataset for training.')
-    parser.add_argument('--test-dataset', action='store', dest='test_dataset', help='Dataset for testing.')
-
     # ========== dataset loading/processing settings related arguments ==========
+    parser.add_argument('--split-type', action='store', dest='split_type',
+                        help='(Optional) How to divide the data set', type=str)
     parser.add_argument('--his-window', action='store', dest='his_window',
-                        help='(Optional) Historical window (default 10)', type=int)
+                        help='(Optional) Use the feature information of the last few seconds (default 3)', type=int)
     parser.add_argument('--fut-window', action='store', dest='fut_window',
-                        help='(Optional) Future (prediction) window (default 10).', type=int)
-    parser.add_argument('--trim-head', action='store', dest='trim_head',
-                        help='(Optional) Trim some part of the viewport trajectory head (default 30).', type=int)
-    parser.add_argument('--trim-tail', action='store', dest='trim_tail',
-                        help='(Optional) Trim some part of the viewport trajectory tail (default 30).', type=int)
-    parser.add_argument('--dataset-frequency', action='store', dest='dataset_frequency',
-                        help='(Optional) The frequency version of the dataset (default 10).', type=int)
-    parser.add_argument('--sample-step', action='store', dest='sample_step',
-                        help='(Optional) The steps for sampling viewports (default 1).', type=int)
-    
+                        help='(Optional) predict the perference of the few future second (default 3)', type=int)
+    parser.add_argument('--video-len', action='store', dest='video_len',
+                        help='(Optional) the length of video (default 10s)', type=int)
+
+
     # ========== training related settings ==========
     parser.add_argument('--epochs', action="store", dest='epochs', help='(Optional) Neural network learning epochs.', type=int)
     parser.add_argument('--epochs-per-valid', action='store', dest='epochs_per_valid', type=int,
@@ -381,63 +340,36 @@ if __name__ == '__main__':
     parser.add_argument('--report-loss-per-steps', action='store', dest='report_loss_per_steps', type=int, default=100,
                         help='(Optional) The number of steps per validation (default 100).')
     parser.add_argument('--lr', action="store", dest='lr', help='(Optional) Neural network learning rate.', type=float)
-    parser.add_argument('--template-lr', action="store", dest='template_lr', help='(Optional) Neural network learning rate for prompt template.', type=float)
     parser.add_argument('--weight-decay', action="store", dest='weight_decay', help='(Optional) Neural network weight decay.', type=float, default=1e-4)
     parser.add_argument('--bs', action="store", dest='bs', help='(Optional) Neural network batch size.', type=int)
-    parser.add_argument('--seed', action="store", dest='seed', type=int, default=1,
-                        help='(Optional) Random seed (default to 1).')
-    parser.add_argument('--teaching-forcing', action="store_true", dest='using_teaching_forcing', help='using teaching forcing.')
-    parser.add_argument('--multimodal', action="store_true", dest='using_multimodal', help='using multimodal.')
-    parser.add_argument('--scheduled-sampling', action="store_true", dest='scheduled_sampling', help='using scheduled_sampling.')
+    parser.add_argument('--grad-accum-steps', action="store", dest='grad_accum_steps', type=int, default=16)
+    parser.add_argument('--seed', action="store", dest='seed', type=int, default=1, help='(Optional) Random seed (default to 1).')
+    parser.add_argument('--multimodal', action="store_true", dest='using_multimodal', help='using multimodal image features.')
     parser.add_argument('--save-checkpoint-per-epoch', action="store", dest='save_checkpoint_per_epoch', help='save checkpoint per epoch', type=int)
     parser.add_argument('--save-checkpoint-per-step', action="store", dest='save_checkpoint_per_step', help='save checkpoint per step', type=int)
-    parser.add_argument('--rank', action="store", dest='rank', help='rank of low-rank matrices', type=int, default=-1)
+    parser.add_argument('--rank', action="store", dest='rank', help='the rank of low rank matrices', type=int, default=-1)
     parser.add_argument('--resume-path', action="store", dest='resume_path', help='using for resume')
-    parser.add_argument('--mix-rate', action="store", dest='mix_rate', help='the rate of mixing when using teaching forcing', type=float, default=0.04)
+    parser.add_argument('--scheduled-sampling', action="store_true", dest='scheduled_sampling', help='using scheduled sampling, a common method to reduce exposure bias to improve '\
+                                                                                                     'sequence generation by mixing teacher-forcing generation and auto-regressive generation. '\
+                                                                                                     'see: https://www.activeloop.ai/resources/glossary/scheduled-sampling/')
+    parser.add_argument('--mix-rate', action="store", dest='mix_rate', help='the mixing rate when using scheduled sampling', type=float, default=0.04)
     args = parser.parse_args()
 
-    # # for debug --- start
-    # args.train = False
-    # args.test = True
-    # args.device = 'cuda:2'
-    # # args.device_mid = 'cuda:4'
-    # args.device_out = 'cuda:4'
-    # args.train_dataset = 'Wu2017'
-    # args.test_dataset = 'Wu2017'
-    # args.dataset_frequency = 5
-    # args.sample_step = 15
-    # args.his_window = 10
-    # args.fut_window = 20
-    # args.plm_type = 'llama'
-    # args.plm_size = 'base'
-    # args.epochs = 1
-    # args.bs = 1
-    # args.lr = 5e-4
-    # args.steps_per_valid = 10000
-    # args.using_teaching_forcing = True
-    # args.using_multimodal = False
-    # args.scheduled_sampling = True
-    # args.rank = 32
-    # args.model_path = '/data-NVMeSSD/wuduo/notmuch/projects/2023_prompt_learning/NetLLM/viewport_prediction/data/ft_plms/try_llama2_7b'
 
     # handle defautl settings
-    args.his_window = cfg.default_history_window if args.his_window is None else args.his_window
-    args.fut_window = cfg.default_future_window if args.fut_window is None else args.fut_window
-    args.trim_head = cfg.default_trim_head if args.trim_head is None else args.trim_head
-    args.trim_tail = cfg.default_trim_tail if args.trim_tail is None else args.trim_tail
-    args.dataset_frequency = cfg.default_dataset_frequency if args.dataset_frequency is None else args.dataset_frequency
-    args.sample_step = cfg.default_sample_step if args.sample_step is None else args.sample_step
+    args.split_type = cfg.split_type if args.split_type is None else args.split_type
+    args.his_window = cfg.his_window if args.his_window is None else args.his_window
+    args.fut_window = cfg.fut_window if args.fut_window is None else args.fut_window
     args.epochs = cfg.default_epochs if args.epochs is None else args.epochs
+    args.lr = cfg.default_lr if args.lr is None else args.lr
     args.weight_decay = cfg.default_weight_decay if args.weight_decay is None else args.weight_decay
-    args.steps_per_valid = cfg.default_steps_per_valid if args.steps_per_valid is None else args.steps_per_valid
+    args.bs = cfg.default_bs if args.bs is None else args.bs
+    args.grad_accum_steps = cfg.default_grad_accum_step if args.grad_accum_steps is None else args.grad_accum_steps
 
+    
     if args.device_out is None:  
         args.device_out = args.device
 
-    if args.train_dataset is None:
-        args.train_dataset = args.test_dataset
-    if args.test_dataset is None:
-        args.test_dataset = args.train_dataset
 
     print(args)
     run(args)

@@ -1,0 +1,4 @@
+huggingface-hub==0.24.5
+transformers>=4.41.0,<4.42.0
+protobuf
+sentencepiece

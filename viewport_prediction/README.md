@@ -137,3 +137,6 @@ If you find this repository useful, please kindly cite the following paper:
       url={https://arxiv.org/abs/2311.06812}, 
 }
 ```
+
+
+ -i https://pypi.tuna.tsinghua.edu.cn/simple
