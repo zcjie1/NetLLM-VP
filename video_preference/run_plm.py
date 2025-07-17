@@ -5,7 +5,7 @@ import random
 import torch
 import sys
 import os
-from dataset.load_dataset import create_dataset
+from dataset.load_dataset import create_preference_dataset
 from models.networking_head import NetworkingHead
 from models.low_rank import peft_model
 from models.pipeline import Pipeline
@@ -110,7 +110,7 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             pipeline.train()
             return valid_loss
         
-    print(f'Training on {args.train_dataset} - bs: {args.bs} - lr: {args.lr} - seed: {args.seed}')
+    print(f'Training  - bs: {args.bs} - lr: {args.lr} - seed: {args.seed}')
     for epoch in range(args.epochs):
         pipeline.train()
         for step, (history, future, video_user_info) in enumerate(dataloader_train): 
@@ -196,23 +196,26 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
     else:
         print('\033[33mWarning:\033[0m', model_path, 'not found, skip loading weights.')
 
-    print(f'Testing on {args.test_dataset} - seed: {args.seed}')
+    print(f'Testing - seed: {args.seed}')
     with torch.no_grad():
         for history, future, video_info in dataloader_test:
             history, future = history.to(args.device), future.to(args.device)
             pred, gt = pipeline.inference(history, future, video_info)
+            print(pred)
+            # 根据类别维度选择概率
+            predicted_class = torch.argmax(pred, dim=2)  # [batch_size]
+            print(predicted_class)
             video_name_ls, height_ls, fps_ls, video_time_ls = [], [], [], []
             video_name_ls.append(video_info[0])
             height_ls.append(int(video_info[1]))
             fps_ls.append(int(video_info[2]))
             video_time_ls.append(int(video_info[3]))
             height_ls, fps_ls, video_time_ls = torch.IntTensor(height_ls), torch.IntTensor(fps_ls), torch.IntTensor(video_time_ls)
-            print(pred, gt, video_name_ls, height_ls, fps_ls, video_time_ls)
+            print(predicted_class, gt, video_name_ls, height_ls, fps_ls, video_time_ls)
 
 def run(args):
     assert args.plm_type in cfg.plm_types
     assert args.plm_size in cfg.plm_sizes
-    assert args.trim_head >= args.his_window and args.trim_tail >= args.fut_window
 
     # seed
     np.random.seed(args.seed)
@@ -250,11 +253,11 @@ def run(args):
         
     # set up networking head
     input_dim = plm.hidden_size
-    out_dim = 3  # = the number of viewport coordinates
+    out_dim = 2  # 输出维度为2，每个样本属于两个类别的 logits（未经过 softmax 的分数）
     if args.plm_type == 'opt' and args.plm_size == 'xxs':
-        networking_head = NetworkingHead(input_dim=512, output_dim=out_dim, fut_window=args.fut_window).to(args.device_out)
+        networking_head = NetworkingHead(input_dim=512, out_dim=out_dim, fut_window=args.fut_window).to(args.device_out)
     else:
-        networking_head = NetworkingHead(input_dim=input_dim, output_dim=out_dim, fut_window=args.fut_window).to(args.device_out)
+        networking_head = NetworkingHead(input_dim=input_dim, out_dim=out_dim, fut_window=args.fut_window).to(args.device_out)
     plm.set_networking_head(networking_head)
     print('PLM model architecture:')
     print(plm)
@@ -278,7 +281,7 @@ def run(args):
     if args.plm_type == 'llava':
         embed_size = 4096
 
-    pipeline = Pipeline(plm, fut_window=args.fut_window, device=args.device, embed_size=embed_size, frequency=args.dataset_frequency, using_multimodal=args.using_multimodal, dataset=args.train_dataset)
+    pipeline = Pipeline(plm, fut_window=args.fut_window, device=args.device, embed_size=embed_size, using_multimodal=args.using_multimodal)
     # print_trainable_parameters(pipeline)
 
     if args.compile:
@@ -289,18 +292,13 @@ def run(args):
     torch.set_float32_matmul_precision('high')
 
     if args.adapt:
-        raw_dataset_train, raw_dataset_valid = create_dataset(args.train_dataset, his_window=args.his_window, 
-                                                              fut_window=args.fut_window, trim_head=args.trim_head, trim_tail=args.trim_tail,
-                                                              include=['train', 'valid'], frequency=args.dataset_frequency, step=args.sample_step)
-        
+        raw_dataset_train, raw_dataset_valid = create_preference_dataset(dataset_dir=cfg.dataset_dir, split_type=args.split_type, his_window=args.his_window, fut_window=args.fut_window, video_len=args.video_len)
         dataloader_train = DataLoader(raw_dataset_train, batch_size=args.bs, shuffle=True, pin_memory=True)
         dataloader_valid = DataLoader(raw_dataset_valid, batch_size=args.bs, shuffle=False, pin_memory=True)
         adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, args.grad_accum_steps)
 
     if args.test:
-        raw_dataset_test = create_dataset(args.test_dataset, his_window=args.his_window, fut_window=args.fut_window,
-                                          trim_head=args.trim_head, trim_tail=args.trim_tail, include=['test'], frequency=args.dataset_frequency, step=args.sample_step)[0]
-        
+        raw_dataset_train, raw_dataset_test = create_preference_dataset(dataset_dir=cfg.dataset_dir, split_type=args.split_type, his_window=args.his_window, fut_window=args.fut_window, video_len=args.video_len)
         dataloader_test = DataLoader(raw_dataset_test, batch_size=args.bs, shuffle=True, pin_memory=True)
         test(args, pipeline, dataloader_test, models_dir, results_dir)
 
@@ -353,6 +351,7 @@ if __name__ == '__main__':
                                                                                                      'sequence generation by mixing teacher-forcing generation and auto-regressive generation. '\
                                                                                                      'see: https://www.activeloop.ai/resources/glossary/scheduled-sampling/')
     parser.add_argument('--mix-rate', action="store", dest='mix_rate', help='the mixing rate when using scheduled sampling', type=float, default=0.04)
+
     args = parser.parse_args()
 
 

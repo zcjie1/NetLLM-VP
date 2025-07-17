@@ -25,9 +25,15 @@ class Pipeline(nn.Module):
         self.embed_size = embed_size
         # 预测未来多少个跨度的。当下是：秒级别的
         self.fut_window_length = fut_window
-
-        self.conv1d = nn.Sequential(nn.Conv1d(1, 256, 3), nn.LeakyReLU(), nn.Flatten()).to(device)
+        self.conv1d = nn.Sequential(nn.Conv1d(1, 256, 7), nn.LeakyReLU(), nn.Flatten()).to(device)
         self.embed_vp = nn.Linear(256, self.embed_size).to(device)
+        self.output_mapper = nn.Sequential(
+            nn.Linear(2, 256),   # 2分类输出映射到隐藏维度
+            nn.ReLU(),
+            nn.Linear(256, self.embed_size)  # 映射到和x同样的embedding维度
+        ).to(device)
+        self.label_embed = nn.Embedding(2, 7).to(device)  # 2分类标签嵌入
+
         self.embed_multimodal = nn.Linear(768, embed_size).to(device)  # 768 = ViT output feature size
         self.embed_ln = nn.LayerNorm(self.embed_size).to(device)
 
@@ -37,7 +43,7 @@ class Pipeline(nn.Module):
         ])
 
         if loss_func is None:
-            loss_func = nn.BCEWithLogitsLoss()
+            loss_func = nn.CrossEntropyLoss()
         self.loss_fct = loss_func
         self.fut_window = fut_window
 
@@ -66,9 +72,10 @@ class Pipeline(nn.Module):
         seq_len = x.shape[1]
         batch_embeddings = []
         for i in range(seq_len):
-            batch_embeddings.append(self.embed_vp(self.conv1d(x[:, i, :]).view(1,256)).unsqueeze(1))
+            # view(1,256) 需要改成 bs,256
+            batch_embeddings.append(self.embed_vp(self.conv1d(x[:, i, :].unsqueeze(1)).view(1,256)).unsqueeze(1))
         x = torch.cat(batch_embeddings, dim=1)
-
+        print(x.shape)
         if self.using_multimodal:  # we make using multimodal image features as an option, as not all datasets provide video information.
             mapped_tensor = self.get_multimodal_information(video_info)
             x = torch.cat([mapped_tensor, x], dim=1)
@@ -78,8 +85,12 @@ class Pipeline(nn.Module):
         outputlist = []
         for _ in range(self.fut_window_length):
             outputs = self.plm(inputs_embeds=x, attention_mask = torch.ones(x.shape[0], x.shape[1], dtype=torch.long, device=self.device))
+            print(outputs.logits.shape)
             outputlist.append(outputs.logits)
-            x = torch.cat((x, self.embed_vp(self.conv1d(outputs.logits)).unsqueeze(1)), dim=1)
+            print(x.shape)
+            print(self.output_mapper(outputs.logits.squeeze(1)).unsqueeze(1).shape)
+            # squeeze(1)去掉seq_len维度
+            x = torch.cat((x, self.output_mapper(outputs.logits.squeeze(1)).unsqueeze(1)), dim=1)
 
         pred = torch.cat(outputlist, dim=1)
         return pred
@@ -93,8 +104,14 @@ class Pipeline(nn.Module):
         :param video_info: details information for current trajectory
         :return: the return value by llm
         """
-
-        x = torch.cat((x, future), dim=1)
+        # future 维度和x维度不一致，需要处理
+        print(x.shape, future.shape)
+        print(future)
+        future_emb = self.label_embed(future)  # shape: [1, 3, 7]
+        print(future_emb.shape)
+        x = torch.cat([x, future_emb], dim=1)  # shape: [1, 6, 7]
+        print(x.shape)
+        # todo:7.15完成到这里，继续debug
         seq_len = x.shape[1]
         batch_embeddings = []
         for i in range(seq_len):

@@ -9,7 +9,7 @@ class Config:
     dataset_name = 'total_llm.csv'
     split_type = None
     his_window = 3
-    video_len =10
+    video_len = 10
     fut_window = 3
     dataset_image_features = './video_feature'
     plm_types = ['gpt2', 'llama', 'llava', 't5-lm', 'opt', 'mistral']
@@ -19,7 +19,7 @@ class Config:
     plms_finetuned_dir = _base_dir + 'data/ft_plms'
     models_dir =  _base_dir + 'data/models'
     results_dir = _base_dir + 'data/results'
-
+    plms_dir = _base_dir + ('../../downloaded_plms' if 'video_prefernce' in _base_dir else '../downloaded_plms')
     
     # time-series model default settings
     default_bs = 1  # batch size

@@ -49,11 +49,11 @@ class EmbeddingModelViewportPrediction(nn.Module):
         seq_len = x.shape[1]
         batch_embeddings = []
         for i in range(seq_len):
-            # conv1d1 接受输入形状 (batch_size, channel=1, 3)，输出是 (batch, 256)
+            # conv1d1 接受输入形状 (batch_size, 3)，输出是 (batch, 256)
             batch_embeddings.append(self.linear_layer(self.conv1d1(x[:, i, :]).view(1,256)).unsqueeze(1))
         # 拼接所有时间步，形成序列输入
         x = torch.cat(batch_embeddings, dim=1)
-
+        print(x.shape)  # shape: (1, seq_len, embed_size)
         if self.using_multimodal:
             # 加载图像特征并线性映射，shape: (1, 1, embed_size)
             mapped_tensor = self.get_multimodal_information(video_user_position)
@@ -68,6 +68,7 @@ class EmbeddingModelViewportPrediction(nn.Module):
             outputs = self.plm(inputs_embeds=x, attention_mask = torch.ones(x.shape[0], x.shape[1], dtype=torch.long, device=self.device))
             # 保存当前时间步的输出 logits，shape: (batch=1, seq_len, hidden)
             self.outputlist.append(outputs.logits)
+            print(outputs.logits.shape)  # shape: (1, seq_len+1, embed_size)
             x = torch.cat((x, self.linear_layer(self.conv1d1(outputs.logits)).unsqueeze(1)), dim=1)
         return self.outputlist
 
@@ -209,6 +210,7 @@ class EmbeddingForViewportPrediction(nn.Module):
         """
         Inference function. Use it for testing.
         """
+        print(batch.shape)
         outputs = self.embedding_model(batch, video_user_info)
         pred = torch.cat(outputs, dim=1)
         gt = future.to(pred.device)

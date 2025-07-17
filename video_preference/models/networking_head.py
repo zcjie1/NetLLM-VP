@@ -6,14 +6,14 @@ class NetworkingHead(nn.Module):
     """
     A simple linear layer as networking head for NetLLM.
     """
-    def __init__(self, input_dim, num_classes, fut_window=None):
+    def __init__(self, input_dim, out_dim, fut_window=None):
         super().__init__()
         self.input_dim = input_dim
         self.fut_window = fut_window
         self.networking_head = nn.Sequential(
             nn.Linear(input_dim, 256),
             nn.ReLU(),
-            nn.Linear(256, num_classes)  # 输出类别数
+            nn.Linear(256, out_dim)  # 输出类别数
         )
     
     def forward(self, input_logits):
