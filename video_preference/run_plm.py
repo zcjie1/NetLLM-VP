@@ -28,6 +28,7 @@ def save_model(args, model, save_dir):
         # low rank matrices are disabled, save whole model
         torch.save(model.state_dict(), os.path.join(save_dir, 'model.bin'))
 
+
 def load_model(args, model, model_dir):
     """
     load fune-tune model
@@ -43,6 +44,7 @@ def load_model(args, model, model_dir):
         # low rank matrices are disabled, load whole model
         model.load_state_dict(torch.load(os.path.join(model_dir, 'model.bin')))
     return model
+
 
 def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_accum_steps):
     file_prefix = f'his_{args.his_window}_fut_{args.fut_window}_epochs_{args.epochs}_bs_{args.bs * args.grad_accum_steps}_'\
@@ -200,7 +202,7 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
     with torch.no_grad():
         for history, future, video_info in dataloader_test:
             history, future = history.to(args.device), future.to(args.device)
-            pred, gt = pipeline.inference(history, future, video_info)
+            pred, gt = pipeline.inference(history, future, video_info) # gt = ground truth
             print(pred)
             # 根据类别维度选择概率
             predicted_class = torch.argmax(pred, dim=2)  # [batch_size]
@@ -212,6 +214,163 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
             video_time_ls.append(int(video_info[3]))
             height_ls, fps_ls, video_time_ls = torch.IntTensor(height_ls), torch.IntTensor(fps_ls), torch.IntTensor(video_time_ls)
             print(predicted_class, gt, video_name_ls, height_ls, fps_ls, video_time_ls)
+
+
+def online_test(args, pipeline, models_dir):
+    """
+    启动一个 HTTP 服务器，用于在线接收请求并返回 LLM 的偏好决策。
+    """
+    import http.server
+    import socketserver
+    import json
+    import csv
+    from functools import partial
+
+    # --- 1. 安全设置 ---
+    SECRET_TOKEN = "678A0CF4-6357-BBEB-2DE2-AAE887AE1F76"
+    print(f"\033[93mSecurity Warning: Using fixed bearer token for authentication.\033[0m")
+
+    # --- 2. 加载模型 ---
+    file_prefix = f'his_{args.his_window}_fut_{args.fut_window}_epochs_{args.epochs}_bs_{args.bs * args.grad_accum_steps}_'\
+                  f'lr_{args.lr}_seed_{args.seed}_rank_{args.rank}_scheduled_sampling_{args.scheduled_sampling}'
+    best_model_path = os.path.join(models_dir, file_prefix, 'best_model')
+    model_path = args.model_path if args.model_path is not None else best_model_path
+    
+    if os.path.exists(model_path):
+        pipeline = load_model(args, pipeline, model_path)
+        print('Successfully loaded weights for online inference from:', model_path)
+    else:
+        print(f'\033[91mError: Model path not found at {model_path}. Cannot start online server.\033[0m')
+        # return
+
+    pipeline.eval()  # 切换到评估模式，关闭 dropout 等
+    print("Model is set to evaluation mode.")
+
+    # --- 3. 预加载并索引数据集 ---
+    # 此步骤为了在接收到请求时，能根据 time_index 快速构建历史特征
+    video_time_index = {}
+    feature_keys = ["pixel_diff", "area_diff", "edge_diff", "hist_diff", "surf_diff", "height", "fps"]
+    csv_path = os.path.join(cfg.dataset_dir, cfg.dataset_name)
+    
+    print(f"Pre-loading and indexing data from {csv_path}...")
+    try:
+        with open(csv_path, 'r', newline='') as f:
+            reader = csv.DictReader(f, delimiter=',')
+            for row in reader:
+                key = (
+                    row["video name"],
+                    int(float(row["time"])),
+                    float(row["height"]),
+                    float(row["fps"])
+                )
+                # 将特征值转换为 float
+                video_time_index[key] = {k: float(row[k.replace('_', ' ')]) for k in feature_keys}
+        print("Data pre-loading complete.")
+    except FileNotFoundError:
+        print(f"\033[91mError: Dataset CSV not found at {csv_path}. Cannot build history features.\033[0m")
+        return
+
+    # --- 4. 定义 HTTP 请求处理器 ---
+    class PredictionHandler(http.server.BaseHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            # 使用 functools.partial 将外部变量传入处理器
+            super().__init__(*args, **kwargs)
+
+        def _send_response(self, status_code, content_type, data):
+            self.send_response(status_code)
+            self.send_header('Content-type', content_type)
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode('utf-8'))
+
+        def do_POST(self):
+            # 安全检查：验证 Authorization Header
+            auth_header = self.headers.get('Authorization')
+            if not auth_header or auth_header != f'Bearer {SECRET_TOKEN}':
+                self._send_response(403, 'application/json', {'error': 'Forbidden - Invalid or missing token.'})
+                print(f"Rejected request from {self.client_address[0]} due to invalid token.")
+                return
+
+            try:
+                # 解析请求体
+                content_length = int(self.headers['Content-Length'])
+                post_data = self.rfile.read(content_length)
+                params = json.loads(post_data)
+
+                # 验证输入参数
+                required_params = ["video_name", "time_index", "height", "fps"]
+                if not all(key in params for key in required_params):
+                    self._send_response(400, 'application/json', {'error': 'Bad Request - Missing parameters.'})
+                    return
+                
+                video_name = params["video_name"]
+                time_index = int(params["time_index"])
+                height = float(params["height"])
+                fps = float(params["fps"])
+                
+                print(f"\nReceived request: video='{video_name}', time={time_index}, resolution={height}, fps={fps}")
+
+                # --- 5. 构造模型输入 ---
+                with torch.no_grad():
+                    # 5.1 构造历史 features (history)
+                    feature_sequence = []
+                    for offset in reversed(range(args.his_window)):
+                        tt = (time_index - offset) % args.video_len
+                        key = (video_name, tt, height, fps)
+                        
+                        past_sample = video_time_index.get(key)
+                        if not past_sample:
+                            raise ValueError(f"Historical data not found for key: {key}")
+                        
+                        feature_vector = [past_sample[k] for k in feature_keys]
+                        feature_sequence.append(feature_vector)
+                    
+                    history = torch.tensor([feature_sequence], dtype=torch.float32).to(args.device) # Batch size = 1
+
+                    # 5.2 构造 video_info
+                    video_info = (video_name, height, fps, time_index)
+
+                    # 5.3 构造固定的 future_label (dummy tensor)
+                    dummy_future = torch.zeros((1, args.fut_window), dtype=torch.long).to(args.device)
+
+                    # --- 6. Pipeline 推理 ---
+                    print("Running model inference...")
+                    pred, _ = pipeline.inference(history, dummy_future, video_info)
+                    
+                    # 将模型输出的 logits 转换为类别 [0, 1]
+                    predicted_labels = torch.argmax(pred, dim=2).squeeze().tolist()
+                    print(f"Inference complete. Predicted labels: {predicted_labels}")
+                    
+                    # 如果 fut_window=1，tolist() 可能会返回一个整数，需要包装成列表
+                    if not isinstance(predicted_labels, list):
+                        predicted_labels = [predicted_labels]
+
+                # --- 7. 返回决策结果 ---
+                response_data = {'labels': predicted_labels}
+                self._send_response(200, 'application/json', response_data)
+
+            except json.JSONDecodeError:
+                self._send_response(400, 'application/json', {'error': 'Bad Request - Invalid JSON.'})
+            except ValueError as e:
+                self._send_response(400, 'application/json', {'error': f'Bad Request - {str(e)}'})
+            except Exception as e:
+                self._send_response(500, 'application/json', {'error': f'Internal Server Error: {str(e)}'})
+                print(f"\033[91mAn unexpected error occurred: {e}\033[0m")
+
+
+    # --- 8. 启动 HTTP 服务器 ---
+    PORT = 8080
+    # 使用 partial 将外部变量绑定到处理器类，避免使用全局变量
+    Handler = partial(PredictionHandler)
+
+    with socketserver.TCPServer(("", PORT), Handler) as httpd:
+        print(f"\n🚀 Online prediction server started on http://0.0.0.0:{PORT}")
+        print("Waiting for requests from the client...")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nShutting down the server.")
+            httpd.shutdown()
+
 
 def run(args):
     assert args.plm_type in cfg.plm_types
@@ -291,16 +450,20 @@ def run(args):
     
     torch.set_float32_matmul_precision('high')
 
-    if args.adapt:
+    if args.online:
+        online_test(args, pipeline, models_dir)
+    elif args.test:
+        raw_dataset_train, raw_dataset_test = create_preference_dataset(dataset_dir=cfg.dataset_dir, split_type=args.split_type, his_window=args.his_window, fut_window=args.fut_window, video_len=args.video_len)
+        dataloader_test = DataLoader(raw_dataset_test, batch_size=args.bs, shuffle=True, pin_memory=True)
+        test(args, pipeline, dataloader_test, models_dir, results_dir)
+    elif args.adapt:
         raw_dataset_train, raw_dataset_valid = create_preference_dataset(dataset_dir=cfg.dataset_dir, split_type=args.split_type, his_window=args.his_window, fut_window=args.fut_window, video_len=args.video_len)
         dataloader_train = DataLoader(raw_dataset_train, batch_size=args.bs, shuffle=True, pin_memory=True)
         dataloader_valid = DataLoader(raw_dataset_valid, batch_size=args.bs, shuffle=False, pin_memory=True)
         adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, args.grad_accum_steps)
-
-    if args.test:
-        raw_dataset_train, raw_dataset_test = create_preference_dataset(dataset_dir=cfg.dataset_dir, split_type=args.split_type, his_window=args.his_window, fut_window=args.fut_window, video_len=args.video_len)
-        dataloader_test = DataLoader(raw_dataset_test, batch_size=args.bs, shuffle=True, pin_memory=True)
-        test(args, pipeline, dataloader_test, models_dir, results_dir)
+    else:
+        return
+        
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Process the input parameters to train the network.')
@@ -308,6 +471,7 @@ if __name__ == '__main__':
     # ========== model/plm settings related arguments ==========
     parser.add_argument('--adapt', action="store_true", help='adapt llm.')
     parser.add_argument('--test', action="store_true", help='test llm.')
+    parser.add_argument('--online', action="store_true", help='online test llm.')
     parser.add_argument('--plm-type', action="store", dest='plm_type', help='type of plm.', default='t5-lm')
     parser.add_argument('--plm-size', action="store", dest='plm_size', help='size of plm.', default='base')
     parser.add_argument('--model-path', action="store", dest='model_path', type=str, help='(Optional) The directory of model weights to be loaded for testing.')
