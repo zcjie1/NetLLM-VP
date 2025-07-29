@@ -13,6 +13,7 @@ from utils.plms_utils import load_plm
 from utils.console_logger import ConsoleLogger
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 
 
 def save_model(args, model, save_dir):
@@ -225,6 +226,7 @@ def online_test(args, pipeline, models_dir):
     import json
     import csv
     from functools import partial
+    import torch.nn.functional as F
 
     # --- 1. 安全设置 ---
     SECRET_TOKEN = "678A0CF4-6357-BBEB-2DE2-AAE887AE1F76"
@@ -259,9 +261,9 @@ def online_test(args, pipeline, models_dir):
             for row in reader:
                 key = (
                     row["video name"],
-                    int(float(row["time"])),
-                    float(row["height"]),
-                    float(row["fps"])
+                    int(row["time"]),
+                    int(row["height"]),
+                    int(row["fps"])
                 )
                 # 将特征值转换为 float
                 video_time_index[key] = {k: float(row[k.replace('_', ' ')]) for k in feature_keys}
@@ -304,8 +306,8 @@ def online_test(args, pipeline, models_dir):
                 
                 video_name = params["video_name"]
                 time_index = int(params["time_index"])
-                height = float(params["height"])
-                fps = float(params["fps"])
+                height = int(params["height"])
+                fps = int(params["fps"])
                 
                 print(f"\nReceived request: video='{video_name}', time={time_index}, resolution={height}, fps={fps}")
 
@@ -335,6 +337,14 @@ def online_test(args, pipeline, models_dir):
                     # --- 6. Pipeline 推理 ---
                     print("Running model inference...")
                     pred, _ = pipeline.inference(history, dummy_future, video_info)
+
+                    probabilities = F.softmax(pred, dim=2)
+                    prob_list = probabilities.squeeze().tolist()
+
+                    if not isinstance(prob_list[0], list):
+                        prob_list = [prob_list]
+                    
+                    print(f"Inference complete. Probabilities: {prob_list}")
                     
                     # 将模型输出的 logits 转换为类别 [0, 1]
                     predicted_labels = torch.argmax(pred, dim=2).squeeze().tolist()
@@ -345,7 +355,10 @@ def online_test(args, pipeline, models_dir):
                         predicted_labels = [predicted_labels]
 
                 # --- 7. 返回决策结果 ---
-                response_data = {'labels': predicted_labels}
+                response_data = {
+                    'probabilities': prob_list,  # 每个时间步的[class0_prob, class1_prob]
+                    'labels': predicted_labels   # 保持向后兼容
+                }
                 self._send_response(200, 'application/json', response_data)
 
             except json.JSONDecodeError:
@@ -358,7 +371,7 @@ def online_test(args, pipeline, models_dir):
 
 
     # --- 8. 启动 HTTP 服务器 ---
-    PORT = 8080
+    PORT = 6006
     # 使用 partial 将外部变量绑定到处理器类，避免使用全局变量
     Handler = partial(PredictionHandler)
 

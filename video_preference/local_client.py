@@ -6,7 +6,7 @@ import time
 import random
 
 # --- 1. 配置 ---
-SERVER_URL = "http://127.0.0.1:8080"
+SERVER_URL = "http://127.0.0.1:6006"
 
 # 与 run_plm.py 中设置的 SECRET_TOKEN 完全一致
 SECRET_TOKEN = "678A0CF4-6357-BBEB-2DE2-AAE887AE1F76"
@@ -20,7 +20,7 @@ SIMULATED_VIDEO_INFO = {
 }
 
 
-def get_preference_from_cloud(video_name: str, time_index: int, height: float, fps: float):
+def get_preference_from_cloud(video_name: str, time_index: int, height: int, fps: int):
     """
     向云服务器发送请求并获取视频偏好决策。
 
@@ -56,6 +56,12 @@ def get_preference_from_cloud(video_name: str, time_index: int, height: float, f
             # 请求成功，解析返回的 JSON 数据
             decision = response.json()
             print(f"[{time_index:02d}s] <- 收到决策: {decision}")
+            if 'probabilities' in decision:
+                print("  概率分布:")
+                for i, prob in enumerate(decision['probabilities']):
+                    fps_prob = prob[0]
+                    res_prob = prob[1]
+                    print(f"    第{i+1}秒: fps概率={fps_prob:.2%}, res概率={res_prob:.2%}")
             return decision.get("labels")
         else:
             print(f"\033[91m[{time_index:02d}s] <- 请求失败，状态码: {response.status_code}\033[0m")
