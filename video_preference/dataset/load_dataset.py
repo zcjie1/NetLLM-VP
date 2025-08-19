@@ -3,6 +3,10 @@ from torch.utils.data import Dataset
 from config import cfg
 import torch
 import csv
+import random
+from collections import defaultdict
+from sklearn.model_selection import train_test_split
+from collections import Counter
 
 class VideoPreferenceDataset(Dataset):
     def __init__(self, data_list):
@@ -21,6 +25,40 @@ class VideoPreferenceDataset(Dataset):
         time = sample["time"]
         return features, label, (video_name, height, fps, time)
 
+
+def split_dataset_per_video(sequence_samples, train_ratio=0.8, seed=42):
+    random.seed(seed)
+    
+    # 按照视频名 + 时间点进行组织
+    video_time_dict = defaultdict(lambda: defaultdict(list))
+    for sample in sequence_samples:
+        video = sample["video_name"]
+        time = sample["time"]
+        video_time_dict[video][time].append(sample)
+    
+    train_data = []
+    val_data = []
+    
+    for video_name, time_dict in video_time_dict.items():
+        all_times = list(time_dict.keys())
+        assert len(all_times) == 10, f"视频 {video_name} 的时间点数量不是10个"
+        
+        selected_times = all_times[:]
+        random.shuffle(selected_times)
+        split_idx = int(train_ratio * len(selected_times))  # 8
+        
+        train_times = set(selected_times[:split_idx])
+        val_times = set(selected_times[split_idx:])
+        
+        for t in train_times:
+            train_data.extend(time_dict[t])
+        for t in val_times:
+            val_data.extend(time_dict[t])
+    
+    print(f"Train samples: {len(train_data)}, Val samples: {len(val_data)}")
+    return train_data, val_data
+
+
 # split_type 划分数据集方式
 # 按照video_name划分训练集/测试集
 # 按照时间划分训练集/测试集
@@ -32,6 +70,8 @@ def create_preference_dataset(dataset_dir=cfg.dataset_dir, split_type=cfg.split_
     csv_path = os.path.join(dataset_dir, cfg.dataset_name)
     data = []
 
+    # 按行读取，存储为字典类型
+    # 每个字典类型存储聚合为列表
     with open(csv_path, 'r', newline='') as f:
         reader = csv.DictReader(f, delimiter=',')
         for row in reader:
@@ -95,9 +135,18 @@ def create_preference_dataset(dataset_dir=cfg.dataset_dir, split_type=cfg.split_
             "height": height,
             "fps": fps
         })
-
+    # 提取用于分层的标签（这里以未来标签序列第一个标签为准）
+    stratify_labels = [s["label"][0] for s in sequence_samples]
     # 数据划分
-    if split_type is None or split_type == "time":
+    if split_type is None or split_type == "random_abs":
+        train_samples, test_samples = train_test_split(
+            sequence_samples,
+            test_size=0.2,
+            random_state=42,
+            stratify=stratify_labels  # 按标签做分层，保证训练/测试集标签分布一致
+        )
+        train_data, test_data = train_samples, test_samples
+    elif split_type == "abs_time":
         train_data = [s for s in sequence_samples if s["time"] <= 7]
         test_data = [s for s in sequence_samples if s["time"] > 7]
     elif split_type == "video_name":

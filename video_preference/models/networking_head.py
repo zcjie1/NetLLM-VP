@@ -10,10 +10,16 @@ class NetworkingHead(nn.Module):
         super().__init__()
         self.input_dim = input_dim
         self.fut_window = fut_window
+        self.hidden_size_1 = 256
+        self.hidden_size_2 = 32
+        # self.dropout = 0.3
         self.networking_head = nn.Sequential(
-            nn.Linear(input_dim, 256),
+            nn.Linear(input_dim, self.hidden_size_1),
             nn.ReLU(),
-            nn.Linear(256, out_dim)  # 输出类别数
+            nn.Linear(self.hidden_size_1, self.hidden_size_2),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size_2, out_dim),
+            nn.Sigmoid()
         )
     
     def forward(self, input_logits):
