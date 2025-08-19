@@ -52,18 +52,20 @@ class Pipeline(nn.Module):
             print("Using FocalLoss as the loss function.")
             loss_func = FocalLoss(gamma=2.0)
         
+        # --- 调整输入维度和网络结构 ---
         self.input_embedding_net = nn.Sequential(
-            nn.Linear(7, 32),
-            nn.ReLU(),
-            nn.LayerNorm(32),
-            nn.Linear(32, 256),
+            nn.Linear(152, 256),  # 输入维度从 7 改为 152
             nn.ReLU(),
             nn.LayerNorm(256),
-            nn.Linear(256, self.embed_size),
+            nn.Linear(256, 512),  # 增加网络容量
+            nn.ReLU(),
+            nn.LayerNorm(512),
+            nn.Linear(512, self.embed_size),
             nn.LayerNorm(self.embed_size)  # 最终输出的embedding维度
         ).to(device)
         
-        self.label_embed = nn.Embedding(2, 7).to(device)  # 用于标签的embedding
+        self.label_embed = nn.Embedding(2, 152).to(device)  # 嵌入维度从 7 改为 152
+
         self.loss_fct = loss_func
         self.fut_window = fut_window
         self.modules_except_plm = nn.ModuleList([  # used to save and load modules except plm
@@ -122,9 +124,13 @@ class Pipeline(nn.Module):
             probs = outputs.logits.squeeze(1).squeeze(-1)
             # 根据阈值0.5进行二分类，得到类别索引（LongTensor）
             class_idx = (probs > 0.5).long()  # 0 或 1
-            # 传入embedding层，得到嵌入
-            pred_emb = self.label_embed(class_idx)  # shape: [bs, embed_dim]
-            pred_emb = self.input_embedding_net(pred_emb)  # 取最大值作为预测结果
+            
+            # --- vvv 代码逻辑确认 vvv ---
+            # self.label_embed 将索引 (0或1) 转换为152维的向量
+            # self.input_embedding_net 再将这个152维向量转换为最终的 embed_size 维向量
+            # --- ^^^ 代码逻辑确认 ^^^ ---
+            pred_emb = self.label_embed(class_idx)  # shape: [bs, 152]
+            pred_emb = self.input_embedding_net(pred_emb)  # shape: [bs, embed_size]
             pred_emb = pred_emb.unsqueeze(1)
             x = torch.cat((x, pred_emb), dim=1)
 
@@ -141,9 +147,12 @@ class Pipeline(nn.Module):
         :return: the return value by llm
         """
         # future 维度和x维度不一致，需要处理
-        # future shape: [1, 3]
-        future_emb = self.label_embed(future)  # shape: [1, 3, 7]
-        x = torch.cat([x, future_emb], dim=1)  # shape: [1, 6, 7]
+        # future shape: [bs, fut_window]
+        # self.label_embed(future) 后 shape: [bs, fut_window, 152]
+        future_emb = self.label_embed(future)
+        # x shape: [bs, his_window, 152]
+        # cat 后 x shape: [bs, his_window + fut_window, 152]
+        x = torch.cat([x, future_emb], dim=1)
         seq_len = x.shape[1]
         batch_embeddings = []
         for i in range(seq_len):

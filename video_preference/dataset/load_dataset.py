@@ -7,6 +7,8 @@ import random
 from collections import defaultdict
 from sklearn.model_selection import train_test_split
 from collections import Counter
+import ast  # 新增: 用于解析字符串形式的列表
+import numpy as np # 新增: 用于处理特征矩阵
 
 class VideoPreferenceDataset(Dataset):
     def __init__(self, data_list):
@@ -17,8 +19,8 @@ class VideoPreferenceDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        features = torch.tensor(sample["features"], dtype=torch.float32)  # shape: [his_window, feature_dim]
-        label = torch.tensor(sample["label"], dtype=torch.long)
+        features = torch.tensor(sample["features"], dtype=torch.float32)  # shape: [his_window, 152]
+        label = torch.tensor(sample["label"], dtype=torch.long) # shape: [his_window, funture_dim]
         video_name = sample["video_name"]
         height = sample["height"]
         fps = sample["fps"]
@@ -65,22 +67,21 @@ def split_dataset_per_video(sequence_samples, train_ratio=0.8, seed=42):
 def create_preference_dataset(dataset_dir=cfg.dataset_dir, split_type=cfg.split_type, his_window=cfg.his_window, fut_window=cfg.fut_window, video_len=cfg.video_len):
     """
     读取 total_llm.csv, 构造包含历史 K s特征的训练/测试集。
-    当 time < K 时，使用 time=0 的数据重复填充。
+    输入特征将是152维，包含30帧的5个特征+2个元数据。
     """
     csv_path = os.path.join(dataset_dir, cfg.dataset_name)
     data = []
 
     # 按行读取，存储为字典类型
-    # 每个字典类型存储聚合为列表
     with open(csv_path, 'r', newline='') as f:
         reader = csv.DictReader(f, delimiter=',')
         for row in reader:
             sample = {
-                "pixel_diff": float(row["pixel diff"]),
-                "area_diff": float(row["area diff"]),
-                "edge_diff": float(row["edge diff"]),
-                "hist_diff": float(row["hist diff"]),
-                "surf_diff": float(row["surf diff"]),
+                "pixels": row["pixels"],
+                "areas": row["areas"],
+                "edges": row["edges"],
+                "corner": row["corner"],
+                "hist": row["hist"],
                 "height": float(row["height"]),
                 "fps": float(row["fps"]),
                 "label": int(row["label"]),
@@ -97,8 +98,7 @@ def create_preference_dataset(dataset_dir=cfg.dataset_dir, split_type=cfg.split_
 
     # 提取特征字段
     feature_keys = [
-        "pixel_diff", "area_diff", "edge_diff", "hist_diff",
-        "surf_diff", "height", "fps"
+        "pixels", "areas", "edges", "corner", "hist"
     ]
 
     # 构建序列样本
@@ -116,7 +116,43 @@ def create_preference_dataset(dataset_dir=cfg.dataset_dir, split_type=cfg.split_
             tt = (t - offset) % video_len
             key = (video, tt, height, fps)
             past_sample = video_time_index.get(key)
-            feature_vector = [past_sample[k] for k in feature_keys]
+            
+            # --- 构建152维特征向量 ---
+            # 初始化一个 30x5 的零矩阵，用于存放30帧的5个特征
+            per_frame_features = np.zeros((30, 5), dtype=np.float32)
+
+            # 解析5个特征的字符串列表
+            feature_lists = []
+            for k in feature_keys:
+                try:
+                    # 使用 ast.literal_eval 安全地将字符串转换为列表
+                    feature_lists.append(ast.literal_eval(past_sample[k]))
+                except (ValueError, SyntaxError):
+                    # 如果解析失败（例如，空字符串），则视为空列表
+                    feature_lists.append([])
+            
+            # print("feature_lists: ", feature_lists)
+            # print("feature_lists shape: ", [len(l) for l in feature_lists])
+
+            # 确定实际的帧数（取5个特征列表长度的最小值）
+            num_frames = min(len(lst) for lst in feature_lists) if feature_lists else 0
+            
+            # 填充特征矩阵
+            for i in range(num_frames):
+                for j in range(len(feature_keys)):
+                    per_frame_features[i, j] = feature_lists[j][i]
+            
+            # print(per_frame_features.shape)
+            # print(per_frame_features)
+            
+            # 将30x5的矩阵展平为150维向量
+            flat_features = per_frame_features.flatten().tolist()
+
+            # print(flat_features)
+            
+            # 拼接 height 和 fps，形成最终的152维向量
+            feature_vector = flat_features + [past_sample["height"], past_sample["fps"]]
+            
             feature_sequence.append(feature_vector)
         
         # 构造未来标签序列，预测未来的（fut_wind）个label
@@ -159,3 +195,11 @@ def create_preference_dataset(dataset_dir=cfg.dataset_dir, split_type=cfg.split_
         raise NotImplementedError("split_type must be None, 'time', or 'video_name'.")
 
     return VideoPreferenceDataset(train_data), VideoPreferenceDataset(test_data)
+
+
+if __name__ == "__main__":
+    raw_dataset_train, raw_dataset_valid = create_preference_dataset(dataset_dir='./dataset',
+                                                                        split_type=None,
+                                                                        his_window=3,
+                                                                        fut_window=3,
+                                                                        video_len=10)
