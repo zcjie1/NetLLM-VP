@@ -17,3 +17,5 @@ video_preference/video_feature
 video_preference/videos
 
 viewport_prediction/data/images/*
+
+*.png

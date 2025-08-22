@@ -12,12 +12,14 @@ class NetworkingHead(nn.Module):
         self.fut_window = fut_window
         self.hidden_size_1 = 256
         self.hidden_size_2 = 32
-        # self.dropout = 0.3
+        self.dropout = 0.1
         self.networking_head = nn.Sequential(
             nn.Linear(input_dim, self.hidden_size_1),
             nn.ReLU(),
+            nn.Dropout(self.dropout),
             nn.Linear(self.hidden_size_1, self.hidden_size_2),
             nn.ReLU(),
+            nn.Dropout(self.dropout),
             nn.Linear(self.hidden_size_2, out_dim),
             nn.Sigmoid()
         )

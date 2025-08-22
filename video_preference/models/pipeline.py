@@ -54,17 +54,19 @@ class Pipeline(nn.Module):
         
         # --- 调整输入维度和网络结构 ---
         self.input_embedding_net = nn.Sequential(
-            nn.Linear(152, 256),  # 输入维度从 7 改为 152
-            nn.ReLU(),
-            nn.LayerNorm(256),
-            nn.Linear(256, 512),  # 增加网络容量
+            nn.Linear(242, 512),      # 输入层加宽
             nn.ReLU(),
             nn.LayerNorm(512),
-            nn.Linear(512, self.embed_size),
-            nn.LayerNorm(self.embed_size)  # 最终输出的embedding维度
+            nn.Dropout(0.2),          # 增加Dropout
+            nn.Linear(512, 768),     # 增加网络深度和宽度
+            nn.ReLU(),
+            nn.LayerNorm(768),
+            nn.Dropout(0.2),          # 增加Dropout
+            nn.Linear(768, self.embed_size),
+            nn.LayerNorm(self.embed_size)
         ).to(device)
         
-        self.label_embed = nn.Embedding(2, 152).to(device)  # 嵌入维度从 7 改为 152
+        self.label_embed = nn.Embedding(2, 242).to(device)  # 嵌入维度从 7 改为 152
 
         self.loss_fct = loss_func
         self.fut_window = fut_window

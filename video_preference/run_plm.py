@@ -106,7 +106,12 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             ), 'weight_decay': args.weight_decay, 'lr': args.lr}
         ]
         optimizer = AdamW(optimizer_grouped_parameters)
-
+    
+    # 1. 增加学习率调节器
+    from torch.optim.lr_scheduler import CosineAnnealingLR
+    # T_max: 调度器走完一个周期的总步数, eta_min: 最低学习率
+    scheduler = CosineAnnealingLR(optimizer, T_max=len(dataloader_train) * args.epochs / grad_accum_steps, eta_min=1e-5)
+    
     assert args.epochs_per_valid is None or args.steps_per_valid is None, "You can only specify args.epochs_per_valid or args.steps_per_valid."
 
     global_step = 0
@@ -185,6 +190,7 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             # 只会在累积了 grad_accum_steps 个批次的梯度后才执行一次
             if ((step + 1) % grad_accum_steps == 0) or (step + 1 == len(dataloader_train)):
                 optimizer.step()
+                scheduler.step()    # 在优化器更新后，调用调度器更新学习率
                 optimizer.zero_grad()
 
             # report training loss
@@ -475,7 +481,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', action="store", dest='lr',
                         help='(Optional) Neural network learning rate.', type=float)
     parser.add_argument('--weight-decay', action="store", dest='weight_decay',
-                        help='(Optional) Neural network weight decay.', type=float, default=1e-4)
+                        help='(Optional) Neural network weight decay.', type=float, default=5e-5)
     parser.add_argument('--bs', action="store", dest='bs',
                         help='(Optional) Neural network batch size.', type=int)
     parser.add_argument('--grad-accum-steps', action="store",
@@ -497,7 +503,7 @@ if __name__ == '__main__':
                         'sequence generation by mixing teacher-forcing generation and auto-regressive generation. '
                         'see: https://www.activeloop.ai/resources/glossary/scheduled-sampling/')
     parser.add_argument('--mix-rate', action="store", dest='mix_rate',
-                        help='the mixing rate when using scheduled sampling', type=float, default=0.1)
+                        help='the mixing rate when using scheduled sampling', type=float, default=0.2)
 
     args = parser.parse_args()
 

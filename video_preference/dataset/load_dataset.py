@@ -82,6 +82,9 @@ def create_preference_dataset(dataset_dir=cfg.dataset_dir, split_type=cfg.split_
                 "edges": row["edges"],
                 "corner": row["corner"],
                 "hist": row["hist"],
+                "hog": row["hog"],
+                "sift": row["sift"],
+                "l2": row["l2"],
                 "height": float(row["height"]),
                 "fps": float(row["fps"]),
                 "label": int(row["label"]),
@@ -98,7 +101,7 @@ def create_preference_dataset(dataset_dir=cfg.dataset_dir, split_type=cfg.split_
 
     # 提取特征字段
     feature_keys = [
-        "pixels", "areas", "edges", "corner", "hist"
+        "pixels", "areas", "edges", "corner", "hist", "hog", "sift", "l2"
     ]
 
     # 构建序列样本
@@ -117,9 +120,9 @@ def create_preference_dataset(dataset_dir=cfg.dataset_dir, split_type=cfg.split_
             key = (video, tt, height, fps)
             past_sample = video_time_index.get(key)
             
-            # --- 构建152维特征向量 ---
-            # 初始化一个 30x5 的零矩阵，用于存放30帧的5个特征
-            per_frame_features = np.zeros((30, 5), dtype=np.float32)
+            # --- 构建242维特征向量 ---
+            # 初始化一个 30x8 的零矩阵，用于存放30帧的8个特征
+            per_frame_features = np.zeros((30, 8), dtype=np.float32)
 
             # 解析5个特征的字符串列表
             feature_lists = []
@@ -134,7 +137,7 @@ def create_preference_dataset(dataset_dir=cfg.dataset_dir, split_type=cfg.split_
             # print("feature_lists: ", feature_lists)
             # print("feature_lists shape: ", [len(l) for l in feature_lists])
 
-            # 确定实际的帧数（取5个特征列表长度的最小值）
+            # 确定实际的帧数（取8个特征列表长度的最小值）
             num_frames = min(len(lst) for lst in feature_lists) if feature_lists else 0
             
             # 填充特征矩阵
@@ -145,12 +148,12 @@ def create_preference_dataset(dataset_dir=cfg.dataset_dir, split_type=cfg.split_
             # print(per_frame_features.shape)
             # print(per_frame_features)
             
-            # 将30x5的矩阵展平为150维向量
+            # 将30x8的矩阵展平为240维向量
             flat_features = per_frame_features.flatten().tolist()
 
             # print(flat_features)
             
-            # 拼接 height 和 fps，形成最终的152维向量
+            # 拼接 height 和 fps，形成最终的242维向量
             feature_vector = flat_features + [past_sample["height"], past_sample["fps"]]
             
             feature_sequence.append(feature_vector)
